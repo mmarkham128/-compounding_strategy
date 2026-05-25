@@ -21,6 +21,8 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+GATED_REGIMES = {"trend_up", "trend_down"}  # regimes where no new buys are opened
+
 
 @dataclass
 class GridConfig:
@@ -28,9 +30,10 @@ class GridConfig:
     upper: float
     num_grids: int
     capital: float
-    fee_rate: float = 0.001  # 0.10 percent spot, charged per side
-    slippage: float = 0.0005  # 0.05 percent per fill
-    geometric: bool = False  # arithmetic spacing by default
+    fee_rate: float = 0.001
+    slippage: float = 0.0005
+    geometric: bool = False
+    circuit_breaker_pct: float | None = None  # drawdown from peak that halts the grid
 
 
 @dataclass
@@ -42,6 +45,10 @@ class GridResult:
     final_cash: float
     final_inventory_value: float
     fees_paid: float
+    realized_profit: float    # net PnL from completed round trips after all costs
+    unrealized_profit: float  # mark to market of held inventory minus cost basis
+    breaker_tripped: bool
+    gated_candles: int        # candles where the buy pass was skipped due to regime
     config: GridConfig
 
     @property
@@ -65,8 +72,22 @@ def build_levels(cfg: GridConfig) -> np.ndarray:
     return np.linspace(cfg.lower, cfg.upper, cfg.num_grids)
 
 
-def simulate_grid(candles: pd.DataFrame, cfg: GridConfig) -> GridResult:
-    """Run the grid over candles with columns open, high, low, close."""
+def simulate_grid(
+    candles: pd.DataFrame,
+    cfg: GridConfig,
+    regime_series: pd.Series | None = None,
+    exit_on_trend_down: bool = False,
+) -> GridResult:
+    """Run the grid over candles with columns open, high, low, close.
+
+    regime_series, if provided, must share the same index as candles.
+    When a candle's regime is trend_up or trend_down, the buy pass is skipped
+    so no new grid positions are opened. The sell pass is always active.
+
+    exit_on_trend_down: when the regime transitions INTO trend_down (was not
+    trend_down on the previous candle), all open holdings are closed at the
+    current candle's close price before the sell pass runs.
+    """
     required = {"open", "high", "low", "close"}
     if not required.issubset(candles.columns):
         raise ValueError(f"candles must contain columns {required}")
@@ -75,37 +96,73 @@ def simulate_grid(candles: pd.DataFrame, cfg: GridConfig) -> GridResult:
     capital_per_grid = cfg.capital / max(cfg.num_grids - 1, 1)
 
     cash = cfg.capital
-    holdings: dict[int, float] = {}  # level index -> qty held, sells at level above
+    # holdings: level index -> (qty, all_in_cost_basis)
+    # cost_basis includes the spend on coin plus entry fee and slippage.
+    holdings: dict[int, tuple[float, float]] = {}
     fees_paid = 0.0
     realized_fills = 0
     round_trips = 0
     winning_round_trips = 0
-    equity = []
+    cumulative_realized_pnl = 0.0
+    equity: list[float] = []
+    peak_equity = cfg.capital
+    halted = False
+    gated_candles = 0
+    prev_regime: str | None = None
 
-    for _, candle in candles.iterrows():
+    for ts, candle in candles.iterrows():
+        if halted:
+            equity.append(cash)
+            continue
+
+        regime: str = regime_series.loc[ts] if regime_series is not None else "ranging"
+        buying_allowed = regime not in GATED_REGIMES
+
         low = candle["low"]
         high = candle["high"]
         close = candle["close"]
 
-        # Buy pass: a resting buy at any level the candle reached down to fills.
-        for i in range(len(levels) - 1):  # top level is a sell target only
-            level = levels[i]
-            if i in holdings:
-                continue
-            if low <= level and cash >= capital_per_grid:
-                qty = capital_per_grid / level
-                fee = capital_per_grid * cfg.fee_rate
-                slip = capital_per_grid * cfg.slippage
-                cash -= capital_per_grid + fee + slip
+        # If the regime just flipped into trend_down, liquidate all holdings.
+        if (
+            exit_on_trend_down
+            and regime == "trend_down"
+            and prev_regime != "trend_down"
+            and holdings
+        ):
+            for i, (qty, cb) in list(holdings.items()):
+                proceeds = qty * close
+                fee = proceeds * cfg.fee_rate
+                slip = proceeds * cfg.slippage
+                net = proceeds - fee - slip
+                cash += net
                 fees_paid += fee + slip
-                holdings[i] = qty
+                cumulative_realized_pnl += net - cb
                 realized_fills += 1
+            holdings.clear()
 
-        # Sell pass: a held lot sells when the candle reaches the level above it.
+        # Buy pass: skipped when regime is gated.
+        if not buying_allowed:
+            gated_candles += 1
+        else:
+            for i in range(len(levels) - 1):
+                if i in holdings:
+                    continue
+                level = levels[i]
+                if low <= level and cash >= capital_per_grid:
+                    qty = capital_per_grid / level
+                    fee = capital_per_grid * cfg.fee_rate
+                    slip = capital_per_grid * cfg.slippage
+                    cost_basis = capital_per_grid + fee + slip
+                    cash -= cost_basis
+                    fees_paid += fee + slip
+                    holdings[i] = (qty, cost_basis)
+                    realized_fills += 1
+
+        # Sell pass: always active regardless of regime.
         for i in list(holdings.keys()):
             target = levels[i + 1]
             if high >= target:
-                qty = holdings.pop(i)
+                qty, cost_basis = holdings.pop(i)
                 proceeds = qty * target
                 fee = proceeds * cfg.fee_rate
                 slip = proceeds * cfg.slippage
@@ -114,15 +171,41 @@ def simulate_grid(candles: pd.DataFrame, cfg: GridConfig) -> GridResult:
                 fees_paid += fee + slip
                 realized_fills += 1
                 round_trips += 1
-                if net > capital_per_grid:
+                pnl = net - cost_basis
+                cumulative_realized_pnl += pnl
+                if pnl > 0:
                     winning_round_trips += 1
 
-        inventory_value = sum(qty * close for qty in holdings.values())
-        equity.append(cash + inventory_value)
+        inventory_value = sum(qty * close for qty, _ in holdings.values())
+        current_equity = cash + inventory_value
+        peak_equity = max(peak_equity, current_equity)
+
+        # Circuit breaker: halt and liquidate if drawdown from peak exceeds threshold.
+        if cfg.circuit_breaker_pct is not None:
+            drawdown = (current_equity / peak_equity - 1.0) * 100.0
+            if drawdown <= -cfg.circuit_breaker_pct:
+                for i, (qty, cb) in list(holdings.items()):
+                    proceeds = qty * close
+                    fee = proceeds * cfg.fee_rate
+                    slip = proceeds * cfg.slippage
+                    net = proceeds - fee - slip
+                    cash += net
+                    fees_paid += fee + slip
+                    pnl = net - cb
+                    cumulative_realized_pnl += pnl
+                    realized_fills += 1
+                holdings.clear()
+                halted = True
+                current_equity = cash
+
+        equity.append(current_equity)
+        prev_regime = regime
 
     equity_curve = pd.Series(equity, index=candles.index, name="equity")
     last_close = candles.iloc[-1]["close"]
-    final_inventory_value = sum(qty * last_close for qty in holdings.values())
+    final_inventory_value = sum(qty * last_close for qty, _ in holdings.values())
+    remaining_cost_basis = sum(cb for _, cb in holdings.values())
+    unrealized_pnl = final_inventory_value - remaining_cost_basis
 
     return GridResult(
         equity_curve=equity_curve,
@@ -132,5 +215,9 @@ def simulate_grid(candles: pd.DataFrame, cfg: GridConfig) -> GridResult:
         final_cash=cash,
         final_inventory_value=final_inventory_value,
         fees_paid=fees_paid,
+        realized_profit=cumulative_realized_pnl,
+        unrealized_profit=unrealized_pnl,
+        breaker_tripped=halted,
+        gated_candles=gated_candles,
         config=cfg,
     )

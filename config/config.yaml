@@ -20,7 +20,8 @@ backtest:
   timeframe: "1h"
   since: "2025-05-25"   # one year back, move forward as time passes
   capital: 1000.0       # backtest sizing for clean percentages; live starts at 50
-  exchange: "binance"   # clean history source, execution happens on Blofin
+  exchange: "kucoin"    # clean history source, execution happens on Blofin
+  lookback_months: 3    # in sample window used to set grid bounds each roll
 
 grid:
   num_grids: 20

@@ -17,6 +17,12 @@ try:
 except ImportError:  # ccxt is only needed for live downloads, not for tests
     ccxt = None
 
+try:
+    import truststore
+    truststore.inject_into_ssl()
+except ImportError:
+    pass
+
 CACHE_DIR = Path("data_cache")
 
 
@@ -56,9 +62,10 @@ def fetch_ohlcv(
         if not batch:
             break
         rows.extend(batch)
-        since_ms = batch[-1][0] + 1
-        if len(batch) < 1000:
-            break
+        new_since_ms = batch[-1][0] + 1
+        if new_since_ms <= since_ms:
+            break  # no progress guard
+        since_ms = new_since_ms
 
     df = pd.DataFrame(rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
