@@ -64,6 +64,8 @@ def walk_forward_backtest(
     exchange_id: str = "kucoin",
     lookback_months: int = 3,
     circuit_breaker_pct: float | None = None,
+    invalidation_pct: float | None = None,
+    use_gating: bool = True,
 ) -> dict:
     df = fetch_ohlcv(symbol, timeframe=timeframe, since=since, exchange_id=exchange_id)
 
@@ -99,7 +101,7 @@ def walk_forward_backtest(
         if upper <= lower:
             continue
 
-        oos_regimes = classify(oos_df)
+        regime_series = classify(oos_df) if use_gating else None
 
         cfg = GridConfig(
             lower=lower,
@@ -109,10 +111,11 @@ def walk_forward_backtest(
             fee_rate=fee_rate,
             slippage=slippage,
             circuit_breaker_pct=circuit_breaker_pct,
+            invalidation_pct=invalidation_pct,
         )
 
-        r_hold = simulate_grid(oos_df, cfg, regime_series=oos_regimes, exit_on_trend_down=False)
-        r_flip = simulate_grid(oos_df, cfg, regime_series=oos_regimes, exit_on_trend_down=True)
+        r_hold = simulate_grid(oos_df, cfg, regime_series=regime_series, exit_on_trend_down=False)
+        r_flip = simulate_grid(oos_df, cfg, regime_series=regime_series, exit_on_trend_down=True)
 
         hold_results.append(r_hold)
         flip_results.append(r_flip)
@@ -136,7 +139,7 @@ def walk_forward_backtest(
     total_round_trips = sum(r.round_trips for r in hold_results)
     total_winning = sum(r.winning_round_trips for r in hold_results)
     total_fees = sum(r.fees_paid for r in hold_results)
-    breaker_trips = sum(1 for r in hold_results if r.breaker_tripped)
+    halt_count = sum(1 for r in hold_results if r.breaker_tripped)
     true_win_rate = total_winning / total_round_trips if total_round_trips > 0 else 0.0
 
     # Per window averages: each window normalised to its own starting capital
@@ -161,7 +164,7 @@ def walk_forward_backtest(
         "fees_paid": round(total_fees, 2),
         "avg_realized_pct": round(avg_realized_pct, 2),
         "avg_unrealized_pct": round(avg_unrealized_pct, 2),
-        "breaker_trips": breaker_trips,
+        "halt_count": halt_count,
         "gated_months": gated_months,
         "pct_gated": round(pct_gated, 1),
         "pct_ranging": round((regimes == "ranging").mean() * 100, 1),

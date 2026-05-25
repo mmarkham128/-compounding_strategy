@@ -48,6 +48,11 @@ risk:
   leverage_cap: 1        # spot only until proven, then 10 to 15, always reversible
   risk_fraction: 0.02
   reinvest_profits: true
+  # Lever 2: range breakout invalidation threshold.
+  # Grid exits when the close price falls more than this percent below the lower bound.
+  # 3% chosen to filter noise wicks (uses close, not low) while exiting before
+  # a confirmed breakdown compounds further losses.
+  invalidation_pct_below_lower: 3.0
 
 phases:
   current: 0

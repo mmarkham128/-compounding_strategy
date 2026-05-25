@@ -34,6 +34,7 @@ class GridConfig:
     slippage: float = 0.0005
     geometric: bool = False
     circuit_breaker_pct: float | None = None  # drawdown from peak that halts the grid
+    invalidation_pct: float | None = None     # pct below lower bound that invalidates the range thesis
 
 
 @dataclass
@@ -184,6 +185,26 @@ def simulate_grid(
         if cfg.circuit_breaker_pct is not None:
             drawdown = (current_equity / peak_equity - 1.0) * 100.0
             if drawdown <= -cfg.circuit_breaker_pct:
+                for i, (qty, cb) in list(holdings.items()):
+                    proceeds = qty * close
+                    fee = proceeds * cfg.fee_rate
+                    slip = proceeds * cfg.slippage
+                    net = proceeds - fee - slip
+                    cash += net
+                    fees_paid += fee + slip
+                    pnl = net - cb
+                    cumulative_realized_pnl += pnl
+                    realized_fills += 1
+                holdings.clear()
+                halted = True
+                current_equity = cash
+
+        # Range breakout invalidation: halt if price closes decisively below the grid floor.
+        # Uses the close price (not the intraday low) so brief wicks do not trigger it.
+        # A close below lower * (1 - invalidation_pct/100) means the range thesis is broken.
+        if not halted and cfg.invalidation_pct is not None:
+            threshold = cfg.lower * (1.0 - cfg.invalidation_pct / 100.0)
+            if close < threshold:
                 for i, (qty, cb) in list(holdings.items()):
                     proceeds = qty * close
                     fee = proceeds * cfg.fee_rate
