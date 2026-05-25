@@ -1,0 +1,52 @@
+# Compounding Strategy configuration.
+# Edit here, never hard code values in modules.
+
+assets:
+  # Top ten by market cap for the Phase 0 backtest. SOL is the baseline.
+  # Narrow to the three to five winners after Phase 0 results are in.
+  symbols:
+    - SOL/USDT
+    - BTC/USDT
+    - ETH/USDT
+    - XRP/USDT
+    - BNB/USDT
+    - ADA/USDT
+    - DOGE/USDT
+    - AVAX/USDT
+    - LINK/USDT
+    - TRX/USDT
+
+backtest:
+  timeframe: "1h"
+  since: "2025-05-25"   # one year back, move forward as time passes
+  capital: 1000.0       # backtest sizing for clean percentages; live starts at 50
+  exchange: "binance"   # clean history source, execution happens on Blofin
+
+grid:
+  num_grids: 20
+  geometric: false
+
+regime:
+  adx_period: 14
+  adx_trend_threshold: 25.0
+  ema_fast: 20
+  ema_slow: 50
+  atr_period: 14
+  atr_chop_threshold: 0.04
+  bb_period: 20
+
+fees:
+  spot_rate: 0.001       # 0.10 percent per side
+  futures_maker: 0.0002  # 0.02 percent
+  futures_taker: 0.0006  # 0.06 percent
+  slippage: 0.0005
+
+risk:
+  max_strategy_drawdown_pct: 20.0
+  account_kill_switch_pct: 30.0
+  leverage_cap: 1        # spot only until proven, then 10 to 15, always reversible
+  risk_fraction: 0.02
+  reinvest_profits: true
+
+phases:
+  current: 0
